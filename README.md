@@ -1,4 +1,4 @@
-# 🐱 Broke Cat Bot V8.3 — SOL-Native Live Trading
+# 🐱 Broke Cat Bot V8.2 — SOL-Native Live Trading
 
 Broke Cat V8 is the SOL-native version of the Railway bot. It keeps the V7 scanner, Helius launch/bundle-risk analysis, holder/dev filters, one-position limit, $1 daily realized-loss kill switch, Jupiter execution, X posts, Telegram alerts, persistent state, and `/health` monitoring — but **live entries now spend SOL instead of requiring USDC**.
 
@@ -115,9 +115,9 @@ npm start
 Add `EXPECTED_WALLET_ADDRESS` to Railway with the public Solana address you intend Broke Cat to trade from. V8.1 derives the public address from `BS58_PRIVATE_KEY`, blocks live trading if it does not match, and cross-checks native SOL balance using both Helius and Solana public RPC. Startup logs show both readings and which source is used. Never place the private key in GitHub.
 
 
-## V8.3 Trust Wallet private-key format fix
+## V8.2 Trust Wallet private-key format fix
 
-`BS58_PRIVATE_KEY` keeps the same Railway variable name for backward compatibility, but V8.3 now auto-detects common Solana private-key encodings:
+`BS58_PRIVATE_KEY` keeps the same Railway variable name for backward compatibility, but V8.2 now auto-detects common Solana private-key encodings:
 
 - base58
 - base64 / base64url (including `+`, `/`, `_`, `-`, and padding)
@@ -125,37 +125,3 @@ Add `EXPECTED_WALLET_ADDRESS` to Railway with the public Solana address you inte
 - JSON byte arrays such as `[12,34,...]`
 
 After decoding, Broke Cat still derives the public address and compares it with `EXPECTED_WALLET_ADDRESS`. If the addresses do not match, live trading is blocked. Do not paste the key into chat or GitHub; keep it only in Railway Variables.
-
-
-## V8.3 key-import fix
-Accepts Ed25519 PKCS#8 DER/PEM private-key exports in addition to raw base58/base64/hex/JSON formats. The derived public address is still checked against `EXPECTED_WALLET_ADDRESS` before live trading is armed.
-
-## V8.4 — real external bundle scanner
-
-V8.4 is rebuilt from the working V8.3 base. The previous launch-cluster estimate is NOT used as the bundle number.
-
-Bundle data now comes from a **separate external provider: Solana Tracker Data API**, using its dedicated `GET /tokens/{token}/bundlers` endpoint. Add this Railway variable:
-
-```env
-SOLANA_TRACKER_API_KEY=your_key_here
-```
-
-Helius remains a separate source for holder concentration and mint/freeze authority. The Railway/Telegram scan line identifies the source as `SOLANA_TRACKER` and prints the actual provider percentage when returned, e.g. `bundle 3.8% LOW (SOLANA_TRACKER)`.
-
-Default bundle handling:
-- under 5%: LOW (+10 score)
-- 5% to under 20%: MEDIUM (-15 score)
-- 20% or higher: HIGH (-40 score and entry blocked)
-- provider missing/error/no percentage: UNKNOWN; clearly labeled with status and does not automatically block an otherwise qualified trade
-
-This requires a Solana Tracker Data API key. If the variable is missing, startup says the bundle scanner is OFF and every scan explicitly reports `API_KEY_MISSING` rather than inventing a bundle estimate.
-
-## V8.5 live position recovery
-V8.5 scans the connected wallet for SPL/Token-2022 holdings and exposes them through `/health`. If Railway restarts and the local state file is unavailable, the bot attempts to recover the most recent still-held buy from Helius transaction history and resume exit monitoring. Set `RECOVERY_LOOKBACK_HOURS` to control the recovery window (default 72 hours).
-
-## V8.8 scanner transparency
-
-V8.8 prints and persists a full scorecard for every discovered coin instead of only printing a total candidate count. See `SCAN-AUDIT-LOGGING.md` and `CHANGELOG-V8.8.md` for the exact fields and Railway persistence instructions.
-
-## V8.10 GeckoTerminal market data
-V8.10 uses GeckoTerminal as the primary Solana new-pool discovery and market-data source. Railway logs show the source on every scored coin. DEX Screener is retained only as an automatic fallback unless `DEXSCREENER_FALLBACK=false`.

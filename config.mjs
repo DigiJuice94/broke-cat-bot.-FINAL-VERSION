@@ -22,6 +22,8 @@ export const config={
   minMarketCap:n('MIN_MARKET_CAP_USD',50000),
   maxMarketCap:n('MAX_MARKET_CAP_USD',5000000),
   heliusApiKey:s('HELIUS_API_KEY'),
+  solanaTrackerApiKey:s('SOLANA_TRACKER_API_KEY'),
+  solanaTrackerTimeoutMs:n('SOLANA_TRACKER_TIMEOUT_MS',8000),
   jupiterApiKey:s('JUPITER_API_KEY'),
   bs58PrivateKey:s('BS58_PRIVATE_KEY'),
   expectedWalletAddress:s('EXPECTED_WALLET_ADDRESS'),
@@ -32,7 +34,7 @@ export const config={
   launchTxLimit:n('LAUNCH_TX_LIMIT',100),launchWindowSeconds:n('LAUNCH_WINDOW_SECONDS',180),minLaunchTxForConfidence:n('MIN_LAUNCH_TX_FOR_CONFIDENCE',4),
   clusterWalletThreshold:n('CLUSTER_WALLET_THRESHOLD',4),clusterRepeatThreshold:n('CLUSTER_REPEAT_THRESHOLD',3),crowdedSlotsHigh:n('CROWDED_SLOTS_HIGH',2),
   maxFundingWalletChecks:n('MAX_FUNDING_WALLET_CHECKS',8),fundingHistoryLimit:n('FUNDING_HISTORY_LIMIT',30),fundingLookbackSeconds:n('FUNDING_LOOKBACK_SECONDS',86400),sharedFunderHighWallets:n('SHARED_FUNDER_HIGH_WALLETS',4),
-  bundleSupplyMediumPct:n('BUNDLE_SUPPLY_MEDIUM_PCT',5),bundleSupplyElevatedPct:n('BUNDLE_SUPPLY_ELEVATED_PCT',10),bundleSupplyHighPct:n('BUNDLE_SUPPLY_HIGH_PCT',20),
+  bundleSupplyMediumPct:n('BUNDLE_SUPPLY_MEDIUM_PCT',5),bundleSupplyHighPct:n('BUNDLE_SUPPLY_HIGH_PCT',20),blockLowBundleConfidence:b('BLOCK_LOW_BUNDLE_CONFIDENCE',false),
   holderTop1MediumPct:n('HOLDER_TOP1_MEDIUM_PCT',10),holderTop1HighPct:n('HOLDER_TOP1_HIGH_PCT',20),holderTop5MediumPct:n('HOLDER_TOP5_MEDIUM_PCT',25),holderTop5HighPct:n('HOLDER_TOP5_HIGH_PCT',40),holderTop10MediumPct:n('HOLDER_TOP10_MEDIUM_PCT',40),holderTop10HighPct:n('HOLDER_TOP10_HIGH_PCT',60)
 };
 export function liveConfigStatus(){

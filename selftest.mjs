@@ -1,3 +1,4 @@
+import { parseBundlersResponse } from './solanatracker.mjs';
 import assert from 'node:assert/strict';
 import { classifyHolderRisk } from './risk.mjs';
 import { Keypair } from '@solana/web3.js';
@@ -22,3 +23,7 @@ for(const [name,encoded] of cases){
   assert.equal(parsed.keypair.publicKey.toBase58(),kp.publicKey.toBase58(),`${name} key parser mismatch`);
 }
 console.log('Broke Cat V8.2 self-test passed');
+
+const bund=parseBundlersResponse({totalBundlerPercentage:12.5,wallets:[{wallet:'a'},{wallet:'b'}]});
+assert.equal(bund.totalBundlerPercentage,12.5); assert.equal(bund.walletCount,2);
+const frac=parseBundlersResponse({data:{totalBundlerPercentage:0.08,wallets:[]}}); assert.equal(frac.totalBundlerPercentage,8);

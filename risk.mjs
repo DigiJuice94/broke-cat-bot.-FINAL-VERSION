@@ -1,80 +1,8 @@
 import { config } from './config.mjs';
-import { enhancedTransactions, getHolderSnapshot, getMintInfo } from './helius.mjs';
+import { getHolderSnapshot, getMintInfo } from './helius.mjs';
+import { getBundlers } from './solanatracker.mjs';
 
 const pct = (n,d) => d > 0 ? n / d * 100 : 0;
-const uniq = xs => [...new Set(xs.filter(Boolean))];
-const asWallet = x => typeof x === 'string' && x.length >= 32 ? x : null;
-
-function txActors(tx) {
-  const actors = [];
-  if (asWallet(tx?.feePayer)) actors.push(tx.feePayer);
-  for (const a of tx?.accountData || []) if (a?.nativeBalanceChange < 0 && asWallet(a.account)) actors.push(a.account);
-  for (const t of tx?.tokenTransfers || []) {
-    if (asWallet(t?.fromUserAccount)) actors.push(t.fromUserAccount);
-    if (asWallet(t?.toUserAccount)) actors.push(t.toUserAccount);
-  }
-  return uniq(actors);
-}
-
-function detectLaunchClusters(txs, mint, pairCreatedAt) {
-  const createdSec = pairCreatedAt ? Math.floor(pairCreatedAt / 1000) : null;
-  const relevant = txs.filter(t => !createdSec || !t.timestamp || Math.abs(Number(t.timestamp)-createdSec) <= config.launchWindowSeconds);
-  const slots = new Map();
-  const actorCounts = new Map();
-  const tokenBuyers = new Set();
-  for (const tx of relevant) {
-    const actors = txActors(tx);
-    for (const w of actors) actorCounts.set(w, (actorCounts.get(w)||0)+1);
-    if (tx?.slot != null) {
-      const arr = slots.get(tx.slot) || [];
-      arr.push(...actors);
-      slots.set(tx.slot, uniq(arr));
-    }
-    for (const tr of tx?.tokenTransfers || []) {
-      if (tr?.mint !== mint) continue;
-      const to = asWallet(tr?.toUserAccount);
-      if (to) tokenBuyers.add(to);
-    }
-  }
-  const crowdedSlots = [...slots.entries()].filter(([,ws]) => ws.length >= config.clusterWalletThreshold)
-    .map(([slot, wallets]) => ({ slot, wallets }));
-  const repeatedActors = [...actorCounts.entries()].filter(([,count])=>count >= config.clusterRepeatThreshold)
-    .map(([wallet,count])=>({wallet,count})).sort((a,b)=>b.count-a.count);
-  const clusterWallets = uniq([...crowdedSlots.flatMap(x=>x.wallets), ...repeatedActors.map(x=>x.wallet)]);
-  return { txCount: relevant.length, crowdedSlots, repeatedActors, clusterWallets, tokenBuyers:[...tokenBuyers] };
-}
-
-async function sharedFunders(wallets, launchTimeSec) {
-  const capped = uniq(wallets).slice(0, config.maxFundingWalletChecks);
-  const funderToWallets = new Map();
-  let checked = 0;
-  for (const wallet of capped) {
-    try {
-      const txs = await enhancedTransactions(wallet, {
-        limit: config.fundingHistoryLimit,
-        sort: 'desc',
-        lteTime: launchTimeSec || undefined,
-        gteTime: launchTimeSec ? launchTimeSec - config.fundingLookbackSeconds : undefined,
-        tokenAccounts:'none'
-      });
-      checked++;
-      const funders = new Set();
-      for (const tx of txs) for (const tr of tx?.nativeTransfers || []) {
-        if (tr?.toUserAccount === wallet && asWallet(tr?.fromUserAccount) && Number(tr?.amount || 0) > 0) funders.add(tr.fromUserAccount);
-      }
-      for (const f of funders) {
-        const arr = funderToWallets.get(f) || [];
-        arr.push(wallet);
-        funderToWallets.set(f, uniq(arr));
-      }
-    } catch { /* Failed funding history lowers confidence; it never fabricates a link. */ }
-  }
-  return {
-    checked,
-    clusters:[...funderToWallets.entries()].filter(([,ws])=>ws.length >= 2)
-      .map(([funder,wallets])=>({funder,wallets})).sort((a,b)=>b.wallets.length-a.wallets.length)
-  };
-}
 
 export function classifyHolderRisk(snapshot) {
   const { totalSupply, holders } = snapshot;
@@ -87,97 +15,57 @@ export function classifyHolderRisk(snapshot) {
   return { holderRisk, top1Pct:top1, top5Pct:top5, top10Pct:top10, topOwners:holders.slice(0,10) };
 }
 
-function classifyBundlePct(bundlePct, sharedClusters, crowdedSlots) {
-  if (Number.isFinite(bundlePct)) {
-    if (bundlePct >= config.bundleSupplyHighPct) return 'high';
-    if (bundlePct >= config.bundleSupplyMediumPct) return 'medium';
-    return 'low';
-  }
-  if (sharedClusters.some(x=>x.wallets.length>=config.sharedFunderHighWallets) || crowdedSlots >= config.crowdedSlotsHigh) return 'high';
-  if (sharedClusters.length || crowdedSlots > 0) return 'medium';
-  return 'unknown';
+function classifyBundlePct(bundlePct) {
+  if (!Number.isFinite(bundlePct)) return 'unknown';
+  if (bundlePct >= config.bundleSupplyHighPct) return 'high';
+  if (bundlePct >= config.bundleSupplyMediumPct) return 'medium';
+  return 'low';
 }
 
-/**
- * V8.4 Axiom-style bundle estimate.
- * This is our own on-chain heuristic, not Axiom's proprietary score/API.
- * It looks for launch-window wallet clustering, shared funding, repeated actors,
- * then measures how much current supply the detected linked wallets still hold.
- */
 export async function analyzeRisk(c) {
   const notes=[];
-  if(!config.heliusApiKey) return {bundleRisk:'unknown',bundlePct:null,holderRisk:'unknown',devRisk:'unknown',confidence:'none',bundleSource:'unavailable',notes:['HELIUS_API_KEY missing; on-chain risk unavailable.']};
+  let holderRisk='unknown',devRisk='unknown';
+  let top1Pct=null,top5Pct=null,top10Pct=null,mintAuthority=null,freezeAuthority=null;
 
-  const [mintResult, holderResult, txResult] = await Promise.allSettled([
-    getMintInfo(c.tokenAddress),
-    getHolderSnapshot(c.tokenAddress),
-    enhancedTransactions(c.tokenAddress,{limit:config.launchTxLimit,sort:'asc',tokenAccounts:'all'})
-  ]);
+  // Existing Helius source remains responsible for holder concentration + mint/freeze authority.
+  if(config.heliusApiKey){
+    try {
+      const [mintInfo, holders] = await Promise.all([getMintInfo(c.tokenAddress), getHolderSnapshot(c.tokenAddress)]);
+      const holder=classifyHolderRisk(holders);
+      holderRisk=holder.holderRisk; top1Pct=holder.top1Pct; top5Pct=holder.top5Pct; top10Pct=holder.top10Pct;
+      mintAuthority=mintInfo.mintAuthority; freezeAuthority=mintInfo.freezeAuthority;
+      devRisk=(mintInfo.freezeAuthority||mintInfo.mintAuthority)?'high':'low';
+      if(mintInfo.freezeAuthority)notes.push('Freeze authority is still enabled.');
+      if(mintInfo.mintAuthority)notes.push('Mint authority is still enabled.');
+    } catch(err){ notes.push(`Helius holder/dev scan failed safely: ${err.message}`); }
+  } else notes.push('HELIUS_API_KEY missing: holder/dev scan unavailable.');
 
-  const mintInfo = mintResult.status==='fulfilled' ? mintResult.value : null;
-  const holders = holderResult.status==='fulfilled' ? holderResult.value : null;
-  const launchTxs = txResult.status==='fulfilled' && Array.isArray(txResult.value) ? txResult.value : [];
-
-  if(mintResult.status==='rejected') notes.push(`Mint authority check unavailable: ${mintResult.reason?.message||'request failed'}`);
-  if(holderResult.status==='rejected') notes.push(`Holder snapshot unavailable: ${holderResult.reason?.message||'request failed'}`);
-  if(txResult.status==='rejected') notes.push(`Launch transaction history unavailable: ${txResult.reason?.message||'request failed'}`);
-
-  const holder = holders ? classifyHolderRisk(holders) : {holderRisk:'unknown'};
-  const cluster = detectLaunchClusters(launchTxs,c.tokenAddress,c.pairCreatedAt);
-  const launchTimeSec = c.pairCreatedAt ? Math.floor(c.pairCreatedAt/1000) : (launchTxs[0]?.timestamp || null);
-
-  let funding={checked:0,clusters:[]};
-  if(cluster.tokenBuyers.length || cluster.clusterWallets.length){
-    funding = await sharedFunders(cluster.tokenBuyers.length ? cluster.tokenBuyers : cluster.clusterWallets, launchTimeSec);
-  }
-  const shared = funding.clusters;
-  const linkedWallets = uniq([...cluster.clusterWallets, ...shared.flatMap(x=>x.wallets)]);
-
-  let bundlePct = null;
-  if(holders?.totalSupply>0){
-    const linkedHeld = holders.holders.filter(h=>linkedWallets.includes(h.owner)).reduce((sum,h)=>sum+h.amount,0);
-    bundlePct = pct(linkedHeld,holders.totalSupply);
-  }
-
-  const bundleRisk = classifyBundlePct(bundlePct, shared, cluster.crowdedSlots.length);
-
-  let devRisk='unknown';
-  if(mintInfo){
-    devRisk='low';
-    if (mintInfo.freezeAuthority) {devRisk='high';notes.push('Freeze authority is still enabled.');}
-    if (mintInfo.mintAuthority) {devRisk='high';notes.push('Mint authority is still enabled.');}
-    if (!mintInfo.freezeAuthority && !mintInfo.mintAuthority) notes.push('Mint and freeze authorities are disabled.');
+  // NEW external data source: Solana Tracker's dedicated bundlers endpoint.
+  let bundleRisk='unknown',bundlePct=null,bundlerWalletCount=null,bundleSource='SOLANA_TRACKER',bundleStatus='NO_DATA';
+  if(config.solanaTrackerApiKey){
+    try {
+      const b=await getBundlers(c.tokenAddress);
+      bundlerWalletCount=b.walletCount;
+      if(Number.isFinite(b.totalBundlerPercentage)){
+        bundlePct=b.totalBundlerPercentage;
+        bundleRisk=classifyBundlePct(bundlePct);
+        bundleStatus='OK';
+        notes.push(`Solana Tracker bundler scan: ${bundlePct.toFixed(2)}% across ${bundlerWalletCount} detected bundler wallet(s).`);
+      } else {
+        bundleStatus='NO_PERCENTAGE';
+        notes.push(`Solana Tracker bundler endpoint returned ${bundlerWalletCount} wallet(s) but no total bundle percentage.`);
+      }
+    } catch(err){
+      bundleStatus='ERROR';
+      notes.push(`Solana Tracker bundler scan failed safely: ${err.message}`);
+    }
+  } else {
+    bundleStatus='API_KEY_MISSING';
+    notes.push('SOLANA_TRACKER_API_KEY missing: NEW bundle scanner is OFF.');
   }
 
-  if (shared.length) notes.push(`${shared.length} shared-funder cluster(s) detected in checked early wallets.`);
-  if (cluster.crowdedSlots.length) notes.push(`${cluster.crowdedSlots.length} launch-window slot(s) had ${config.clusterWalletThreshold}+ observed actors.`);
-  if (Number.isFinite(bundlePct)) notes.push(`Detected linked wallets currently hold an estimated ${bundlePct.toFixed(2)}% of supply.`);
-
-  let confidence='low';
-  if(launchTxs.length>=config.minLaunchTxForConfidence && holders?.totalSupply>0 && funding.checked>0) confidence='medium';
-  if(launchTxs.length>=Math.max(config.minLaunchTxForConfidence*3,12) && holders?.totalSupply>0 && funding.checked>=Math.min(4,config.maxFundingWalletChecks)) confidence='high';
-  if(!launchTxs.length) confidence='none';
-
-  // V8.4 intentionally fails open on UNKNOWN bundle data. Unknown is displayed and scored neutrally.
   return {
-    bundleRisk,
-    bundlePct,
-    estimatedLinkedSupplyPct:bundlePct,
-    bundleSource:Number.isFinite(bundlePct)?'linked-wallet supply estimate':(launchTxs.length?'launch-cluster heuristic':'unavailable'),
-    holderRisk:holder.holderRisk,
-    devRisk,
-    confidence,
-    linkedWalletCount:linkedWallets.length,
-    sharedFunderClusters:shared.length,
-    fundingWalletsChecked:funding.checked,
-    crowdedLaunchSlots:cluster.crowdedSlots.length,
-    repeatedLaunchActors:cluster.repeatedActors.length,
-    launchTransactionsObserved:cluster.txCount,
-    top1Pct:holder.top1Pct,
-    top5Pct:holder.top5Pct,
-    top10Pct:holder.top10Pct,
-    mintAuthority:mintInfo?.mintAuthority ?? null,
-    freezeAuthority:mintInfo?.freezeAuthority ?? null,
-    notes
+    bundleRisk, bundlePct, totalBundlerPercentage:bundlePct, bundlerWalletCount, bundleSource, bundleStatus,
+    holderRisk,devRisk,top1Pct,top5Pct,top10Pct,mintAuthority,freezeAuthority,notes
   };
 }

@@ -37,7 +37,7 @@ async function maybeDailyX(){
 }
 
 if(isLive){lastWallet=await assertLiveFunding();await alert(`🐱 Broke Cat Bot V8.4 STARTED | 🔴 LIVE MONEY | wallet ${walletAddress()} | SOL ${lastWallet.sol.toFixed(6)} (~$${lastWallet.solValueUsd.toFixed(2)}) | max trade ~$${config.livePositionUsd.toFixed(2)} | SOL reserve ${config.minSolReserve} | daily stop -$${config.maxDailyLoss.toFixed(2)}`)}
-else await alert(`🐱 Broke Cat Bot V8.4 started | PAPER MODE | bankroll $${state.cash.toFixed(2)} | min score ${config.minScore} | on-chain risk ${config.heliusApiKey?'ON':'OFF'} | X ${xReady()?'ON':'OFF'}`);
+else await alert(`🐱 Broke Cat Bot V8.4 started | PAPER MODE | bankroll $${state.cash.toFixed(2)} | min score ${config.minScore} | Helius ${config.heliusApiKey?'ON':'OFF'} | SolanaTracker bundle scanner ${config.solanaTrackerApiKey?'ON':'OFF'} | X ${xReady()?'ON':'OFF'}`);
 
 do{
   try{
@@ -54,7 +54,7 @@ do{
       for(const c of candidates){
         const last=seen.get(c.tokenAddress)||0;if(Date.now()-last<600000)continue;seen.set(c.tokenAddress,Date.now());
         const s=await scoreCandidate(c),gate=entryAllowed(s);
-        if(s.score>=60){const r=s.risk;await alert(`🐱 ${s.symbol} ${s.score}/100 | MC $${s.marketCap.toFixed(0)} | liq $${s.liquidityUsd.toFixed(0)} | 5m vol $${s.volume5m.toFixed(0)} | bundle ${Number.isFinite(r.bundlePct)?`${r.bundlePct.toFixed(1)}% ${String(r.bundleRisk).toUpperCase()}`:`UNKNOWN`} | holders ${String(r.holderRisk).toUpperCase()}${Number.isFinite(r.top10Pct)?` (top10 ${r.top10Pct.toFixed(1)}%)`:''} | dev ${String(r.devRisk).toUpperCase()} | ${gate.ok?'ENTRY OK':`NO TRADE: ${gate.why}`}`)}
+        if(s.score>=60){const r=s.risk;await alert(`🐱 ${s.symbol} ${s.score}/100 | MC $${s.marketCap.toFixed(0)} | liq $${s.liquidityUsd.toFixed(0)} | 5m vol $${s.volume5m.toFixed(0)} | bundle ${Number.isFinite(r.bundlePct)?`${r.bundlePct.toFixed(1)}% ${String(r.bundleRisk).toUpperCase()}`:`${String(r.bundleRisk).toUpperCase()} [${r.bundleStatus}]`} (${r.bundleSource}) | holders ${String(r.holderRisk).toUpperCase()}${Number.isFinite(r.top10Pct)?` (top10 ${r.top10Pct.toFixed(1)}%)`:''} | dev ${String(r.devRisk).toUpperCase()} | ${gate.ok?'ENTRY OK':`NO TRADE: ${gate.why}`}`)}
         if(gate.ok){
           if(isLive){const opened=await openLive(state,s);await alert(`🐱 ${opened.message}`);const snap=await walletSnapshot();await postToX(buyPost({mode:'LIVE',symbol:s.symbol,sizeUsd:state.position.costUsd,score:s.score,marketCap:s.marketCap,risk:s.risk,cash:snap.solValueUsd,walletLabel:'SOL value'}))}
           else{const msg=openPaper(state,s);await alert(`🐱 ${msg}`);if(state.position)await postToX(buyPost({mode:'PAPER',symbol:s.symbol,sizeUsd:state.position.sizeUsd,score:s.score,marketCap:s.marketCap,risk:s.risk,cash:state.cash}))}

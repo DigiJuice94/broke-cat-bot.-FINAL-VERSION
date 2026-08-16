@@ -26,7 +26,7 @@ V8 can only spend **SOL that actually exists on-chain in the exported Solana wal
 - Stop: **-15%**
 - Take profit: **+50%**
 - Trailing exit arms after **+25%**, exits after a **12%** pullback from the high
-- Unknown bundle analysis: shown as `UNKNOWN` and allowed to continue (fail-open); confirmed HIGH bundle risk is blocked
+- Unknown/low-confidence bundle analysis: blocked by default
 - SOL reserve: **0.003 SOL**
 
 ## Railway Variables — LIVE mode
@@ -130,18 +130,22 @@ After decoding, Broke Cat still derives the public address and compares it with 
 ## V8.3 key-import fix
 Accepts Ed25519 PKCS#8 DER/PEM private-key exports in addition to raw base58/base64/hex/JSON formats. The derived public address is still checked against `EXPECTED_WALLET_ADDRESS` before live trading is armed.
 
-## V8.4 — Axiom-style bundle scanner
+## V8.4 — real external bundle scanner
 
-V8.4 keeps the working V8.3 live-trading/key-import behavior and upgrades bundle analysis with an Axiom-style **on-chain heuristic**. This is Broke Cat's own scanner; it does not claim to use Axiom's proprietary backend.
+V8.4 is rebuilt from the working V8.3 base. The previous launch-cluster estimate is NOT used as the bundle number.
 
-The scanner now checks launch-window wallet clustering, repeated actors, shared funding between early wallets, and the current supply still held by detected linked wallets. The log/Telegram line reports an estimated bundle percentage when enough on-chain data is available, for example `bundle 4.2% LOW`.
+Bundle data now comes from a **separate external provider: Solana Tracker Data API**, using its dedicated `GET /tokens/{token}/bundlers` endpoint. Add this Railway variable:
 
-Default bundle treatment:
+```env
+SOLANA_TRACKER_API_KEY=your_key_here
+```
 
-- under 5%: LOW, small positive score adjustment
-- 5-10%: MEDIUM, small score penalty
-- 10-20%: MEDIUM/elevated, larger score penalty
-- 20% or more: HIGH and entry is rejected
-- unavailable data: `UNKNOWN`, neutral score, **does not block a trade by itself**
+Helius remains a separate source for holder concentration and mint/freeze authority. The Railway/Telegram scan line identifies the source as `SOLANA_TRACKER` and prints the actual provider percentage when returned, e.g. `bundle 3.8% LOW (SOLANA_TRACKER)`.
 
-Holder and dev-authority hard-risk checks remain active. Bundle scanner request failures are isolated so a failed holder/mint request does not automatically wipe out every other risk signal.
+Default bundle handling:
+- under 5%: LOW (+10 score)
+- 5% to under 20%: MEDIUM (-15 score)
+- 20% or higher: HIGH (-40 score and entry blocked)
+- provider missing/error/no percentage: UNKNOWN; clearly labeled with status and does not automatically block an otherwise qualified trade
+
+This requires a Solana Tracker Data API key. If the variable is missing, startup says the bundle scanner is OFF and every scan explicitly reports `API_KEY_MISSING` rather than inventing a bundle estimate.

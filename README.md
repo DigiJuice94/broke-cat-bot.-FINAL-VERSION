@@ -152,3 +152,10 @@ This requires a Solana Tracker Data API key. If the variable is missing, startup
 
 ## V8.5 live position recovery
 V8.5 scans the connected wallet for SPL/Token-2022 holdings and exposes them through `/health`. If Railway restarts and the local state file is unavailable, the bot attempts to recover the most recent still-held buy from Helius transaction history and resume exit monitoring. Set `RECOVERY_LOOKBACK_HOURS` to control the recovery window (default 72 hours).
+
+## V8.8 scanner transparency
+
+V8.8 prints and persists a full scorecard for every discovered coin instead of only printing a total candidate count. See `SCAN-AUDIT-LOGGING.md` and `CHANGELOG-V8.8.md` for the exact fields and Railway persistence instructions.
+
+## V8.10 GeckoTerminal market data
+V8.10 uses GeckoTerminal as the primary Solana new-pool discovery and market-data source. Railway logs show the source on every scored coin. DEX Screener is retained only as an automatic fallback unless `DEXSCREENER_FALLBACK=false`.

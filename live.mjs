@@ -173,7 +173,7 @@ export async function walletTokenBalance(mint){
   const amountRaw=rows.reduce((sum,x)=>sum+rawBigInt(x.amountRaw),0n);
   return {mint,amount:rawToUi(amountRaw,decimals),amountRaw:String(amountRaw),decimals};
 }
-async function waitForTokenBalance(mint,predicate,{attempts=12,delayMs=1500}={}){
+async function waitForTokenBalance(mint,predicate,{attempts=20,delayMs=1500}={}){
   let last=await walletTokenBalance(mint);
   for(let i=0;i<attempts;i++){
     if(predicate(last))return last;
@@ -181,6 +181,47 @@ async function waitForTokenBalance(mint,predicate,{attempts=12,delayMs=1500}={})
     last=await walletTokenBalance(mint);
   }
   return last;
+}
+
+async function confirmedTransaction(signature,{attempts=20,delayMs=1000}={}){
+  let lastError=null;
+  for(let i=0;i<attempts;i++){
+    try{
+      const tx=await rpc('getTransaction',[signature,{encoding:'jsonParsed',commitment:'confirmed',maxSupportedTransactionVersion:0}]);
+      if(tx?.meta)return tx;
+    }catch(e){lastError=e}
+    await new Promise(r=>setTimeout(r,delayMs));
+  }
+  if(lastError)console.error(`🐱 RECEIPT RPC warning ${signature}: ${lastError.message}`);
+  return null;
+}
+
+function ownerTokenDeltas(tx,owner){
+  const pre=new Map(),post=new Map(),decimals=new Map();
+  const add=(map,row)=>{
+    if(!row?.mint||row?.owner!==owner)return;
+    const raw=rawBigInt(row?.uiTokenAmount?.amount||'0');
+    map.set(row.mint,(map.get(row.mint)||0n)+raw);
+    if(row?.uiTokenAmount?.decimals!=null)decimals.set(row.mint,Number(row.uiTokenAmount.decimals));
+  };
+  for(const row of tx?.meta?.preTokenBalances||[])add(pre,row);
+  for(const row of tx?.meta?.postTokenBalances||[])add(post,row);
+  const mints=new Set([...pre.keys(),...post.keys()]);
+  return [...mints].map(mint=>{
+    const before=pre.get(mint)||0n,after=post.get(mint)||0n;
+    return {mint,beforeRaw:before,afterRaw:after,deltaRaw:after-before,decimals:Number(decimals.get(mint)||0)};
+  }).filter(x=>x.deltaRaw!==0n);
+}
+
+async function verifyBuyReceipt(signature,expectedMint){
+  const owner=wallet().publicKey.toBase58();
+  const tx=await confirmedTransaction(signature);
+  if(!tx)return {ok:false,reason:'transaction-receipt-unavailable',deltas:[]};
+  if(tx?.meta?.err)return {ok:false,reason:`transaction-meta-error ${JSON.stringify(tx.meta.err)}`,deltas:[]};
+  const deltas=ownerTokenDeltas(tx,owner);
+  const expected=deltas.find(x=>x.mint===expectedMint&&x.deltaRaw>0n)||null;
+  const positive=deltas.filter(x=>x.deltaRaw>0n).sort((a,b)=>a.deltaRaw===b.deltaRaw?0:(a.deltaRaw>b.deltaRaw?-1:1));
+  return {ok:Boolean(expected),expected,positive,deltas,tx};
 }
 
 export async function scanWalletPositions(s){
@@ -261,6 +302,12 @@ export async function reconcileLivePosition(s){
   const currentRaw=rawBigInt(exact.amountRaw);
   const preExistingRaw=rawBigInt(p.preExistingRaw||'0');
   if(currentRaw<=preExistingRaw){
+    const openedMs=Date.parse(p.openedAt||'');
+    const receiptGrace=Number.isFinite(openedMs)&&Date.now()-openedMs<90000&&String(p.mintVerifiedSource||'').startsWith('transaction');
+    if(receiptGrace){
+      console.log(`🐱 POSITION RECONCILE WAIT | ${p.symbol} receipt verified on-chain but wallet RPC has not exposed the token account yet; keeping position managed during 90s grace window`);
+      return {recovered:false,managed:true,pendingWalletVisibility:true,position:p};
+    }
     s.trades.push({type:'POSITION_GONE',mode:'LIVE',symbol:p.symbol,tokenAddress:p.tokenAddress,lastKnownRaw:p.tokenAmountRaw||'0',walletRaw:exact.amountRaw,at:new Date().toISOString()});
     s.position=null;saveLiveState(s);
     return {recovered:false,cleared:true,reason:'wallet-balance-zero-or-only-preexisting'};
@@ -335,6 +382,7 @@ async function jupiterSwap(inputMint,outputMint,amountRaw){
 }
 export async function openLive(s,c){
   if(s.position)throw new Error('Live position already open');
+  if(s.tradingPaused)throw new Error(`Live trading paused: ${s.pauseReason||'manual/safety pause'}`);
   if(s.dailyPnl<=-config.maxDailyLoss)throw new Error('Daily loss limit reached');
   const snap=await assertLiveFunding();
   const sizing=chooseLivePositionSize(c,snap);
@@ -346,22 +394,51 @@ export async function openLive(s,c){
   const amountRaw=Math.floor(sizeSol*LAMPORTS_PER_SOL);
   console.log(`🐱 BUY VERIFY ${c.symbol} | scanner mint ${c.tokenAddress} | wallet before ${before.amountRaw} raw`);
   const swap=await jupiterSwap(SOL_MINT,c.tokenAddress,amountRaw);
-  const after=await waitForTokenBalance(c.tokenAddress,x=>rawBigInt(x.amountRaw)>beforeRaw);
-  const afterRaw=rawBigInt(after.amountRaw);
-  const receivedRaw=afterRaw-beforeRaw;
-  if(receivedRaw<=0n)throw new Error(`BUY CONFIRMED BUT EXPECTED MINT NOT RECEIVED: ${c.symbol} ${c.tokenAddress} | tx ${swap.signature}. Position NOT marked open; inspect transaction before trading again.`);
+  console.log(`🐱 BUY CHAIN CONFIRMED ${c.symbol} | tx ${swap.signature} | waiting for token-account visibility + transaction receipt`);
+
+  // Wallet RPC visibility can lag after a successful swap. First wait up to ~30s for the expected mint.
+  let after=await waitForTokenBalance(c.tokenAddress,x=>rawBigInt(x.amountRaw)>beforeRaw,{attempts:20,delayMs:1500});
+  let afterRaw=rawBigInt(after.amountRaw);
+  let receivedRaw=afterRaw-beforeRaw;
+  let receipt=null;
+  let verificationSource='wallet-rpc';
+
+  // If the token account is still invisible, inspect the confirmed transaction itself.
+  // preTokenBalances/postTokenBalances are authoritative for what mint the wallet actually received.
+  if(receivedRaw<=0n){
+    receipt=await verifyBuyReceipt(swap.signature,c.tokenAddress);
+    if(receipt.ok&&receipt.expected){
+      receivedRaw=receipt.expected.deltaRaw;
+      const txAfterRaw=receipt.expected.afterRaw;
+      after={mint:c.tokenAddress,amount:rawToUi(txAfterRaw,receipt.expected.decimals),amountRaw:String(txAfterRaw),decimals:receipt.expected.decimals};
+      afterRaw=txAfterRaw;
+      verificationSource='transaction-token-balance-delta';
+      console.log(`🐱 BUY RECEIPT VERIFIED ${c.symbol} | expected mint ${c.tokenAddress} | +${receivedRaw} raw from confirmed transaction; wallet RPC visibility is delayed`);
+    }else{
+      const actual=(receipt?.positive||[]).filter(x=>x.mint!==SOL_MINT)[0]||null;
+      const positiveText=(receipt?.positive||[]).map(x=>`${x.mint} +${x.deltaRaw}`).join(' | ')||'none';
+      s.tradingPaused=true;
+      s.pauseReason=`Unresolved buy receipt ${swap.signature}: expected mint ${c.tokenAddress} not received`;
+      s.lastBuyIncident={at:new Date().toISOString(),symbol:c.symbol,expectedMint:c.tokenAddress,actualPositiveMint:actual?.mint||null,actualPositiveRaw:actual?String(actual.deltaRaw):null,signature:swap.signature,receiptReason:receipt?.reason||'expected-mint-missing',positiveDeltas:positiveText};
+      s.trades.push({type:'BUY_RECONCILE_FAILED',mode:'LIVE',symbol:c.symbol,expectedMint:c.tokenAddress,actualMint:actual?.mint||null,actualRaw:actual?String(actual.deltaRaw):null,signature:swap.signature,positiveDeltas:positiveText,at:new Date().toISOString()});
+      saveLiveState(s);
+      throw new Error(`BUY CONFIRMED BUT EXPECTED MINT NOT VERIFIED: ${c.symbol} ${c.tokenAddress} | tx ${swap.signature} | positive wallet deltas: ${positiveText} | NEW BUYS PAUSED for safety. The transaction is documented in live state.`);
+    }
+  }
+
   const receivedUi=rawToUi(receivedRaw,after.decimals);
   const actualCostSol=Number(swap.inputRaw)/LAMPORTS_PER_SOL;
   const actualCostUsd=actualCostSol*snap.solUsd;
   const verifiedEntryPrice=receivedUi>0?actualCostUsd/receivedUi:c.priceUsd;
-  s.position={pairAddress:c.pairAddress,tokenAddress:c.tokenAddress,symbol:c.symbol,entryPrice:verifiedEntryPrice,highPrice:Math.max(Number(c.priceUsd||0),verifiedEntryPrice),lastPrice:c.priceUsd,costSol:actualCostSol,costUsd:actualCostUsd,entrySolUsd:snap.solUsd,tokenAmountRaw:String(receivedRaw),walletBalanceRaw:String(afterRaw),tokenDecimals:after.decimals,preExistingRaw:String(beforeRaw),openedAt:new Date().toISOString(),buySignature:swap.signature,score:c.score,mintVerified:true,autoSized:config.autoPositionSizing,sizingWalletPct:sizing.walletPct,sizingConfidence:sizing.confidence};
-  s.trades.push({type:'BUY',mode:'LIVE',symbol:c.symbol,tokenAddress:c.tokenAddress,costSol:actualCostSol,costUsd:actualCostUsd,tokenAmountRaw:String(receivedRaw),walletBalanceRaw:String(afterRaw),tokenDecimals:after.decimals,preExistingRaw:String(beforeRaw),price:verifiedEntryPrice,score:c.score,autoSized:config.autoPositionSizing,sizingWalletPct:sizing.walletPct,sizingConfidence:sizing.confidence,signature:swap.signature,at:new Date().toISOString()});
+  s.position={pairAddress:c.pairAddress,tokenAddress:c.tokenAddress,symbol:c.symbol,entryPrice:verifiedEntryPrice,highPrice:Math.max(Number(c.priceUsd||0),verifiedEntryPrice),lastPrice:c.priceUsd,costSol:actualCostSol,costUsd:actualCostUsd,entrySolUsd:snap.solUsd,tokenAmountRaw:String(receivedRaw),walletBalanceRaw:String(afterRaw),tokenDecimals:after.decimals,preExistingRaw:String(beforeRaw),openedAt:new Date().toISOString(),buySignature:swap.signature,score:c.score,mintVerified:true,mintVerifiedSource:verificationSource,autoSized:config.autoPositionSizing,sizingWalletPct:sizing.walletPct,sizingConfidence:sizing.confidence};
+  s.trades.push({type:'BUY',mode:'LIVE',symbol:c.symbol,tokenAddress:c.tokenAddress,costSol:actualCostSol,costUsd:actualCostUsd,tokenAmountRaw:String(receivedRaw),walletBalanceRaw:String(afterRaw),tokenDecimals:after.decimals,preExistingRaw:String(beforeRaw),price:verifiedEntryPrice,score:c.score,mintVerifiedSource:verificationSource,autoSized:config.autoPositionSizing,sizingWalletPct:sizing.walletPct,sizingConfidence:sizing.confidence,signature:swap.signature,at:new Date().toISOString()});
   saveLiveState(s);
-  return {message:`LIVE BUY ~${actualCostSol.toFixed(6)} SOL (~$${actualCostUsd.toFixed(2)}) ${c.symbol} | mint VERIFIED ${c.tokenAddress} | received ${receivedUi} ${c.symbol} | tx ${swap.signature}`,signature:swap.signature};
+  return {message:`LIVE BUY ~${actualCostSol.toFixed(6)} SOL (~$${actualCostUsd.toFixed(2)}) ${c.symbol} | mint VERIFIED via ${verificationSource} ${c.tokenAddress} | received ${receivedUi} ${c.symbol} | tx ${swap.signature}`,signature:swap.signature};
 }
 
 export function exitReason(s,price,currentSolUsd=null){
   const p=s.position;if(!p||price<=0)return null;
+  if(p.forceExitReason)return p.forceExitReason;
   p.highPrice=Math.max(Number(p.highPrice)||p.entryPrice,price);p.lastPrice=price;
   const recovered=p.basisType==='SOL_RECOVERED'&&p.entryPriceSol&&currentSolUsd;
   const currentBasis=recovered?price/currentSolUsd:price;

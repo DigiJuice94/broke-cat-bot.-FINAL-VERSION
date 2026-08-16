@@ -277,10 +277,45 @@ export async function reconcileLivePosition(s){
 export async function assertLiveFunding(){
   const snap=await walletSnapshot();
   console.log(`Wallet diagnostic | derived ${snap.address} | Helius ${snap.heliusLamports==null?'ERR':(snap.heliusLamports/LAMPORTS_PER_SOL).toFixed(6)} SOL | Public RPC ${snap.publicLamports==null?'ERR':(snap.publicLamports/LAMPORTS_PER_SOL).toFixed(6)} SOL | using ${snap.balanceSource}`);
-  const tradeSol=config.livePositionUsd/snap.solUsd;
-  const needed=tradeSol+config.minSolReserve;
-  if(snap.sol<needed)throw new Error(`Live wallet needs about ${needed.toFixed(6)} SOL (~$${config.livePositionUsd.toFixed(2)} trade + ${config.minSolReserve} SOL reserve). Found ${snap.sol.toFixed(6)} SOL (~$${snap.solValueUsd.toFixed(2)}).`);
-  return {...snap,tradeSolRequired:tradeSol};
+  const spendableSol=Math.max(0,snap.sol-config.minSolReserve);
+  if(spendableSol<=0)throw new Error(`Live wallet has no spendable SOL after the ${config.minSolReserve} SOL network reserve. Found ${snap.sol.toFixed(6)} SOL.`);
+  return {...snap,spendableSol};
+}
+
+export function chooseLivePositionSize(c,snap){
+  const spendableSol=Math.max(0,snap.sol-config.minSolReserve);
+  if(spendableSol<=0)return {sizeSol:0,sizeUsd:0,walletPct:0,confidence:0,reasons:['no spendable SOL']};
+  if(!config.autoPositionSizing){
+    const sizeSol=Math.min(config.livePositionUsd/snap.solUsd,spendableSol);
+    return {sizeSol,sizeUsd:sizeSol*snap.solUsd,walletPct:snap.sol>0?sizeSol/snap.sol*100:0,confidence:null,reasons:['fixed LIVE_POSITION_USD mode']};
+  }
+
+  // Autonomous sizing: score is the main signal, then verified risk/market quality nudges the allocation.
+  // The configured max can be 100%, but MIN_SOL_RESERVE is always retained for network fees / a future exit.
+  let confidence=Math.max(0,Math.min(100,Number(c?.score||0)));
+  const reasons=[`score ${confidence.toFixed(0)}`];
+  const r=c?.risk||{};
+  if(r.bundleRisk==='low'){confidence+=4;reasons.push('low bundle risk');}
+  else if(r.bundleRisk==='unknown'){confidence-=5;reasons.push('bundle unknown');}
+  if(r.holderRisk==='low'){confidence+=3;reasons.push('holder risk low');}
+  else if(r.holderRisk==='unknown'){confidence-=3;reasons.push('holders unknown');}
+  if(r.devRisk==='low'){confidence+=3;reasons.push('dev risk low');}
+  else if(r.devRisk==='unknown'){confidence-=3;reasons.push('dev unknown');}
+  if(Number(c?.liquidityUsd)>=100000){confidence+=4;reasons.push('liq >= $100k');}
+  if(Number(c?.volume5m)>=50000){confidence+=3;reasons.push('5m vol >= $50k');}
+  confidence=Math.max(0,Math.min(100,confidence));
+
+  const minPct=Math.max(0,Math.min(100,config.autoSizeMinWalletPct));
+  const maxPct=Math.max(minPct,Math.min(100,config.autoSizeMaxWalletPct));
+  // Map entry-quality confidence from the entry threshold..100 into the configured wallet range.
+  const floor=Math.max(1,Math.min(99,config.minScore));
+  const normalized=Math.max(0,Math.min(1,(confidence-floor)/(100-floor)));
+  // Squared curve keeps marginal setups smaller while allowing the strongest setups to use most/all spendable funds.
+  const walletPct=minPct+(maxPct-minPct)*(normalized**2);
+  const pctOfWalletSol=snap.sol*(walletPct/100);
+  const sizeSol=Math.min(spendableSol,pctOfWalletSol);
+  const sizeUsd=sizeSol*snap.solUsd;
+  return {sizeSol,sizeUsd,walletPct:snap.sol>0?sizeSol/snap.sol*100:0,confidence,reasons};
 }
 async function jupiterSwap(inputMint,outputMint,amountRaw){
   const signer=wallet();
@@ -302,11 +337,10 @@ export async function openLive(s,c){
   if(s.position)throw new Error('Live position already open');
   if(s.dailyPnl<=-config.maxDailyLoss)throw new Error('Daily loss limit reached');
   const snap=await assertLiveFunding();
-  const spendableSol=Math.max(0,snap.sol-config.minSolReserve);
-  const targetSol=config.livePositionUsd/snap.solUsd;
-  const sizeSol=Math.min(targetSol,spendableSol);
-  const sizeUsd=sizeSol*snap.solUsd;
-  if(sizeUsd<0.50)throw new Error(`Not enough spendable SOL after reserve. Wallet has ${snap.sol.toFixed(6)} SOL (~$${snap.solValueUsd.toFixed(2)})`);
+  const sizing=chooseLivePositionSize(c,snap);
+  const {sizeSol,sizeUsd}=sizing;
+  if(sizeUsd<config.autoSizeMinTradeUsd)throw new Error(`Autonomous size was only $${sizeUsd.toFixed(2)}, below minimum $${config.autoSizeMinTradeUsd.toFixed(2)}. Wallet has ${snap.sol.toFixed(6)} SOL (~$${snap.solValueUsd.toFixed(2)}).`);
+  console.log(`🐱 AUTO SIZE ${c.symbol} | confidence ${sizing.confidence==null?'FIXED':sizing.confidence.toFixed(0)}/100 | using ${sizing.walletPct.toFixed(1)}% of wallet = ${sizeSol.toFixed(6)} SOL (~$${sizeUsd.toFixed(2)}) | reserve ${config.minSolReserve} SOL | ${sizing.reasons.join(', ')}`);
   const before=await walletTokenBalance(c.tokenAddress);
   const beforeRaw=rawBigInt(before.amountRaw);
   const amountRaw=Math.floor(sizeSol*LAMPORTS_PER_SOL);
@@ -320,8 +354,8 @@ export async function openLive(s,c){
   const actualCostSol=Number(swap.inputRaw)/LAMPORTS_PER_SOL;
   const actualCostUsd=actualCostSol*snap.solUsd;
   const verifiedEntryPrice=receivedUi>0?actualCostUsd/receivedUi:c.priceUsd;
-  s.position={pairAddress:c.pairAddress,tokenAddress:c.tokenAddress,symbol:c.symbol,entryPrice:verifiedEntryPrice,highPrice:Math.max(Number(c.priceUsd||0),verifiedEntryPrice),lastPrice:c.priceUsd,costSol:actualCostSol,costUsd:actualCostUsd,entrySolUsd:snap.solUsd,tokenAmountRaw:String(receivedRaw),walletBalanceRaw:String(afterRaw),tokenDecimals:after.decimals,preExistingRaw:String(beforeRaw),openedAt:new Date().toISOString(),buySignature:swap.signature,score:c.score,mintVerified:true};
-  s.trades.push({type:'BUY',mode:'LIVE',symbol:c.symbol,tokenAddress:c.tokenAddress,costSol:actualCostSol,costUsd:actualCostUsd,tokenAmountRaw:String(receivedRaw),walletBalanceRaw:String(afterRaw),tokenDecimals:after.decimals,preExistingRaw:String(beforeRaw),price:verifiedEntryPrice,score:c.score,signature:swap.signature,at:new Date().toISOString()});
+  s.position={pairAddress:c.pairAddress,tokenAddress:c.tokenAddress,symbol:c.symbol,entryPrice:verifiedEntryPrice,highPrice:Math.max(Number(c.priceUsd||0),verifiedEntryPrice),lastPrice:c.priceUsd,costSol:actualCostSol,costUsd:actualCostUsd,entrySolUsd:snap.solUsd,tokenAmountRaw:String(receivedRaw),walletBalanceRaw:String(afterRaw),tokenDecimals:after.decimals,preExistingRaw:String(beforeRaw),openedAt:new Date().toISOString(),buySignature:swap.signature,score:c.score,mintVerified:true,autoSized:config.autoPositionSizing,sizingWalletPct:sizing.walletPct,sizingConfidence:sizing.confidence};
+  s.trades.push({type:'BUY',mode:'LIVE',symbol:c.symbol,tokenAddress:c.tokenAddress,costSol:actualCostSol,costUsd:actualCostUsd,tokenAmountRaw:String(receivedRaw),walletBalanceRaw:String(afterRaw),tokenDecimals:after.decimals,preExistingRaw:String(beforeRaw),price:verifiedEntryPrice,score:c.score,autoSized:config.autoPositionSizing,sizingWalletPct:sizing.walletPct,sizingConfidence:sizing.confidence,signature:swap.signature,at:new Date().toISOString()});
   saveLiveState(s);
   return {message:`LIVE BUY ~${actualCostSol.toFixed(6)} SOL (~$${actualCostUsd.toFixed(2)}) ${c.symbol} | mint VERIFIED ${c.tokenAddress} | received ${receivedUi} ${c.symbol} | tx ${swap.signature}`,signature:swap.signature};
 }

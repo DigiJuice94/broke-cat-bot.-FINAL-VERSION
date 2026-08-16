@@ -26,7 +26,7 @@ V8 can only spend **SOL that actually exists on-chain in the exported Solana wal
 - Stop: **-15%**
 - Take profit: **+50%**
 - Trailing exit arms after **+25%**, exits after a **12%** pullback from the high
-- Unknown/low-confidence bundle analysis: blocked by default
+- Unknown bundle analysis: shown as `UNKNOWN` and allowed to continue (fail-open); confirmed HIGH bundle risk is blocked
 - SOL reserve: **0.003 SOL**
 
 ## Railway Variables — LIVE mode
@@ -129,3 +129,19 @@ After decoding, Broke Cat still derives the public address and compares it with 
 
 ## V8.3 key-import fix
 Accepts Ed25519 PKCS#8 DER/PEM private-key exports in addition to raw base58/base64/hex/JSON formats. The derived public address is still checked against `EXPECTED_WALLET_ADDRESS` before live trading is armed.
+
+## V8.4 — Axiom-style bundle scanner
+
+V8.4 keeps the working V8.3 live-trading/key-import behavior and upgrades bundle analysis with an Axiom-style **on-chain heuristic**. This is Broke Cat's own scanner; it does not claim to use Axiom's proprietary backend.
+
+The scanner now checks launch-window wallet clustering, repeated actors, shared funding between early wallets, and the current supply still held by detected linked wallets. The log/Telegram line reports an estimated bundle percentage when enough on-chain data is available, for example `bundle 4.2% LOW`.
+
+Default bundle treatment:
+
+- under 5%: LOW, small positive score adjustment
+- 5-10%: MEDIUM, small score penalty
+- 10-20%: MEDIUM/elevated, larger score penalty
+- 20% or more: HIGH and entry is rejected
+- unavailable data: `UNKNOWN`, neutral score, **does not block a trade by itself**
+
+Holder and dev-authority hard-risk checks remain active. Bundle scanner request failures are isolated so a failed holder/mint request does not automatically wipe out every other risk signal.

@@ -78,7 +78,7 @@ export function parseKey(raw){
     const bytes=bs58.decode(value);
     return makeKeypair(bytes,'base58');
   }catch(err){
-    throw new Error(`Unsupported Solana private-key format. V8.3 accepts base58, raw/base64url, hex, JSON byte arrays, and Ed25519 PKCS#8/PEM keys. ${err?.message||''}`.trim());
+    throw new Error(`Unsupported Solana private-key format. V8.4 accepts base58, raw/base64url, hex, JSON byte arrays, and Ed25519 PKCS#8/PEM keys. ${err?.message||''}`.trim());
   }
 }
 function wallet(){

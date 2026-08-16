@@ -1,0 +1,63 @@
+import { config } from './config.mjs';
+
+const rpcUrl = () => `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(config.heliusApiKey)}`;
+const enhancedBase = 'https://api-mainnet.helius-rpc.com';
+
+export async function heliusRpc(method, params = []) {
+  if (!config.heliusApiKey) throw new Error('HELIUS_API_KEY missing');
+  const r = await fetch(rpcUrl(), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 'broke-cat', method, params })
+  });
+  if (!r.ok) throw new Error(`Helius RPC ${r.status}`);
+  const body = await r.json();
+  if (body.error) throw new Error(`Helius ${method}: ${body.error.message || JSON.stringify(body.error)}`);
+  return body.result;
+}
+
+export async function enhancedTransactions(address, { limit = 100, sort = 'asc', gteTime, lteTime, tokenAccounts = 'none' } = {}) {
+  if (!config.heliusApiKey) throw new Error('HELIUS_API_KEY missing');
+  const q = new URLSearchParams({
+    'api-key': config.heliusApiKey,
+    'limit': String(Math.max(1, Math.min(100, limit))),
+    'sort-order': sort,
+    'commitment': 'confirmed',
+    'token-accounts': tokenAccounts
+  });
+  if (gteTime != null) q.set('gte-time', String(Math.floor(gteTime)));
+  if (lteTime != null) q.set('lte-time', String(Math.floor(lteTime)));
+  const r = await fetch(`${enhancedBase}/v0/addresses/${address}/transactions?${q}`,
+    { headers: { accept: 'application/json' } });
+  if (!r.ok) throw new Error(`Helius enhanced tx ${r.status}`);
+  return r.json();
+}
+
+export async function getMintInfo(mint) {
+  const result = await heliusRpc('getAccountInfo', [mint, { encoding: 'jsonParsed', commitment: 'confirmed' }]);
+  const info = result?.value?.data?.parsed?.info || {};
+  return {
+    mintAuthority: info.mintAuthority ?? null,
+    freezeAuthority: info.freezeAuthority ?? null,
+    supplyRaw: info.supply ?? null,
+    decimals: Number(info.decimals ?? 0)
+  };
+}
+
+export async function getHolderSnapshot(mint) {
+  const [largest, supply] = await Promise.all([
+    heliusRpc('getTokenLargestAccounts', [mint, { commitment: 'confirmed' }]),
+    heliusRpc('getTokenSupply', [mint, { commitment: 'confirmed' }])
+  ]);
+  const accounts = largest?.value || [];
+  if (!accounts.length) return { totalSupply: Number(supply?.value?.uiAmount || 0), holders: [] };
+  const infos = await heliusRpc('getMultipleAccounts', [accounts.map(x => x.address), { encoding: 'jsonParsed', commitment: 'confirmed' }]);
+  const byOwner = new Map();
+  for (let i = 0; i < accounts.length; i++) {
+    const owner = infos?.value?.[i]?.data?.parsed?.info?.owner || `token-account:${accounts[i].address}`;
+    const amount = Number(accounts[i].uiAmount ?? accounts[i].uiAmountString ?? 0) || 0;
+    byOwner.set(owner, (byOwner.get(owner) || 0) + amount);
+  }
+  const holders = [...byOwner.entries()].map(([owner, amount]) => ({ owner, amount })).sort((a,b)=>b.amount-a.amount);
+  return { totalSupply: Number(supply?.value?.uiAmount ?? supply?.value?.uiAmountString ?? 0) || 0, holders };
+}

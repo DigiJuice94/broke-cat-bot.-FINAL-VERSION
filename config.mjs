@@ -16,6 +16,7 @@ export const config={
   trailDrawdownPct:n('TRAIL_DRAWDOWN_PCT',12),
   minScore:n('MIN_SCORE',90),
   pollSeconds:n('POLL_SECONDS',30),
+  recoveryLookbackHours:n('RECOVERY_LOOKBACK_HOURS',72),
   maxTokenAgeMinutes:n('MAX_TOKEN_AGE_MINUTES',240),
   minLiquidity:n('MIN_LIQUIDITY_USD',25000),
   min5mVolume:n('MIN_5M_VOLUME_USD',10000),

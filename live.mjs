@@ -135,6 +135,99 @@ export async function walletSnapshot(){
   const solUsd=await solUsdPrice();
   return {address:w,sol,solUsd,solValueUsd:sol*solUsd,balanceSource:bal.source,heliusLamports:bal.heliusLamports,publicLamports:bal.publicLamports};
 }
+
+
+async function tokenPairByMint(mint){
+  const r=await fetch(`https://api.dexscreener.com/token-pairs/v1/solana/${mint}`,{headers:{accept:'application/json'}});
+  if(!r.ok)return null;
+  const rows=await r.json();
+  return (Array.isArray(rows)?rows:[]).filter(x=>Number(x?.priceUsd)>0).sort((a,b)=>Number(b?.liquidity?.usd||0)-Number(a?.liquidity?.usd||0))[0]||null;
+}
+
+async function walletTokenBalances(){
+  const owner=wallet().publicKey.toBase58();
+  const programs=['TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA','TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'];
+  const results=await Promise.all(programs.map(programId=>rpc('getTokenAccountsByOwner',[owner,{programId},{encoding:'jsonParsed',commitment:'confirmed'}]).catch(()=>({value:[]}))));
+  const out=[];
+  for(const row of results.flatMap(x=>x?.value||[])){
+    const info=row?.account?.data?.parsed?.info;
+    const mint=info?.mint, a=info?.tokenAmount;
+    const ui=Number(a?.uiAmountString??a?.uiAmount??0)||0;
+    if(!mint||ui<=0)continue;
+    out.push({mint,amount:ui,amountRaw:String(a?.amount||'0'),decimals:Number(a?.decimals||0)});
+  }
+  return out;
+}
+
+export async function scanWalletPositions(s){
+  const balances=await walletTokenBalances();
+  const currentSolUsd=await solUsdPrice().catch(()=>null);
+  const positions=[];
+  for(const b of balances.slice(0,20)){
+    const pair=await tokenPairByMint(b.mint).catch(()=>null); if(!pair)continue;
+    const priceUsd=Number(pair.priceUsd||0), currentValueUsd=priceUsd*b.amount;
+    if(currentValueUsd<0.05)continue;
+    const managed=s?.position?.tokenAddress===b.mint;
+    let pnlPct=null, entryPrice=null;
+    if(managed){
+      entryPrice=Number(s.position.entryPrice||0)||null;
+      if(s.position.basisType==='SOL_RECOVERED'&&s.position.entryPriceSol&&currentSolUsd)pnlPct=((priceUsd/currentSolUsd)/s.position.entryPriceSol-1)*100;
+      else if(entryPrice)pnlPct=(priceUsd/entryPrice-1)*100;
+    }
+    positions.push({symbol:pair.baseToken?.symbol||'?',tokenAddress:b.mint,pairAddress:pair.pairAddress,tokenAmount:b.amount,tokenAmountRaw:b.amountRaw,priceUsd,currentValueUsd,pnlPct,entryPrice,managed});
+  }
+  return positions.sort((a,b)=>b.currentValueUsd-a.currentValueUsd);
+}
+
+async function recentEnhancedWalletTxs(){
+  const owner=wallet().publicKey.toBase58();
+  const q=new URLSearchParams({'api-key':config.heliusApiKey,limit:'100','sort-order':'desc',commitment:'confirmed'});
+  const r=await fetch(`https://api-mainnet.helius-rpc.com/v0/addresses/${owner}/transactions?${q}`,{headers:{accept:'application/json'}});
+  if(!r.ok)throw new Error(`Helius recovery history ${r.status}`);
+  return r.json();
+}
+
+function recoverySwapAmounts(tx,mint,owner){
+  const swap=tx?.events?.swap||{};
+  const nativeInput=Number(swap?.nativeInput?.amount||0);
+  const swapTokenOut=(swap?.tokenOutputs||[]).filter(x=>x?.mint===mint).reduce((a,x)=>a+Number(x?.tokenAmount||x?.rawTokenAmount?.tokenAmount||0),0);
+  const transferTokenOut=(tx?.tokenTransfers||[]).filter(x=>x?.mint===mint&&x?.toUserAccount===owner).reduce((a,x)=>a+Number(x?.tokenAmount||0),0);
+  const transferNativeOut=(tx?.nativeTransfers||[]).reduce((sum,x)=>sum+(x?.fromUserAccount===owner&&x?.toUserAccount!==owner?Number(x?.amount||0):0),0);
+  return {received:swapTokenOut||transferTokenOut,spentLamports:nativeInput||transferNativeOut};
+}
+
+export async function recoverLivePosition(s){
+  if(s.position)return {recovered:false,reason:'state-position-present'};
+  const owner=wallet().publicKey.toBase58();
+  const balances=await walletTokenBalances();
+  if(!balances.length)return {recovered:false,reason:'no-token-balances'};
+  const txs=await recentEnhancedWalletTxs();
+  const cutoff=Date.now()-config.recoveryLookbackHours*3600_000;
+  const candidates=[];
+  for(const b of balances){
+    const tx=(Array.isArray(txs)?txs:[]).find(t=>{
+      const ts=Number(t?.timestamp||0)*1000;if(!ts||ts<cutoff)return false;
+      const amounts=recoverySwapAmounts(t,b.mint,owner);
+      return amounts.received>0&&amounts.spentLamports>100000;
+    });
+    if(!tx)continue;
+    const pair=await tokenPairByMint(b.mint).catch(()=>null);if(!pair)continue;
+    const {received,spentLamports}=recoverySwapAmounts(tx,b.mint,owner);
+    if(received<=0||spentLamports<=0)continue;
+    const costSol=spentLamports/LAMPORTS_PER_SOL;
+    const entryPriceSol=costSol/received;
+    candidates.push({b,tx,pair,received,costSol,entryPriceSol,ts:Number(tx.timestamp||0)});
+  }
+  candidates.sort((a,b)=>b.ts-a.ts);
+  const c=candidates[0];if(!c)return {recovered:false,reason:'no-recent-broke-cat-like-buy-found'};
+  const solUsd=await solUsdPrice();
+  const entryPrice=c.entryPriceSol*solUsd;
+  s.position={pairAddress:c.pair.pairAddress,tokenAddress:c.b.mint,symbol:c.pair.baseToken?.symbol||'?',entryPrice,entryPriceSol:c.entryPriceSol,basisType:'SOL_RECOVERED',highPrice:Number(c.pair.priceUsd||entryPrice),highPriceSol:Number(c.pair.priceUsd||entryPrice)/solUsd,lastPrice:Number(c.pair.priceUsd||entryPrice),costSol:c.costSol,costUsd:c.costSol*solUsd,entrySolUsd:solUsd,tokenAmountRaw:c.b.amountRaw,openedAt:new Date(c.ts*1000).toISOString(),buySignature:c.tx.signature,score:null,recoveredAt:new Date().toISOString()};
+  s.trades.push({type:'RECOVER',mode:'LIVE',symbol:s.position.symbol,tokenAddress:c.b.mint,costSol:c.costSol,tokenAmountRaw:c.b.amountRaw,signature:c.tx.signature,at:new Date().toISOString()});
+  saveLiveState(s);
+  return {recovered:true,position:s.position};
+}
+
 export async function assertLiveFunding(){
   const snap=await walletSnapshot();
   console.log(`Wallet diagnostic | derived ${snap.address} | Helius ${snap.heliusLamports==null?'ERR':(snap.heliusLamports/LAMPORTS_PER_SOL).toFixed(6)} SOL | Public RPC ${snap.publicLamports==null?'ERR':(snap.publicLamports/LAMPORTS_PER_SOL).toFixed(6)} SOL | using ${snap.balanceSource}`);
@@ -177,13 +270,18 @@ export async function openLive(s,c){
   saveLiveState(s);
   return {message:`LIVE BUY ~${actualCostSol.toFixed(6)} SOL (~$${actualCostUsd.toFixed(2)}) ${c.symbol} | tx ${swap.signature}`,signature:swap.signature};
 }
-export function exitReason(s,price){
+export function exitReason(s,price,currentSolUsd=null){
   const p=s.position;if(!p||price<=0)return null;
   p.highPrice=Math.max(Number(p.highPrice)||p.entryPrice,price);p.lastPrice=price;
-  const retPct=(price/p.entryPrice-1)*100;
+  const recovered=p.basisType==='SOL_RECOVERED'&&p.entryPriceSol&&currentSolUsd;
+  const currentBasis=recovered?price/currentSolUsd:price;
+  const entryBasis=recovered?p.entryPriceSol:p.entryPrice;
+  if(recovered)p.highPriceSol=Math.max(Number(p.highPriceSol)||entryBasis,currentBasis);
+  const highBasis=recovered?p.highPriceSol:p.highPrice;
+  const retPct=(currentBasis/entryBasis-1)*100;
   if(retPct<=-config.stopLossPct)return `STOP -${config.stopLossPct}%`;
   if(retPct>=config.takeProfitPct)return `TAKE PROFIT +${config.takeProfitPct}%`;
-  if((p.highPrice/p.entryPrice-1)*100>=config.trailArmPct && (1-price/p.highPrice)*100>=config.trailDrawdownPct)return `TRAIL after +${config.trailArmPct}%`;
+  if((highBasis/entryBasis-1)*100>=config.trailArmPct && (1-currentBasis/highBasis)*100>=config.trailDrawdownPct)return `TRAIL after +${config.trailArmPct}%`;
   saveLiveState(s);return null;
 }
 export async function closeLive(s,reason){

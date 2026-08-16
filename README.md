@@ -149,3 +149,6 @@ Default bundle handling:
 - provider missing/error/no percentage: UNKNOWN; clearly labeled with status and does not automatically block an otherwise qualified trade
 
 This requires a Solana Tracker Data API key. If the variable is missing, startup says the bundle scanner is OFF and every scan explicitly reports `API_KEY_MISSING` rather than inventing a bundle estimate.
+
+## V8.5 live position recovery
+V8.5 scans the connected wallet for SPL/Token-2022 holdings and exposes them through `/health`. If Railway restarts and the local state file is unavailable, the bot attempts to recover the most recent still-held buy from Helius transaction history and resume exit monitoring. Set `RECOVERY_LOOKBACK_HOURS` to control the recovery window (default 72 hours).
